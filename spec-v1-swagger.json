@@ -1686,12 +1686,6 @@
         {
           "type": "object",
           "properties": {
-            "accounts": {
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/Account"
-              }
-            },
             "payees": {
               "type": "array",
               "items": {
@@ -2083,7 +2077,8 @@
         },
         "goal_type": {
           "type": "string",
-          "enum": ["TB", "TBD", "MF", "NEED", "DEBT", null],
+          "enum": ["TB", "TBD", "MF", "NEED", "DEBT"],
+          "x-nullable": true,
           "description": "The type of goal, if the category has a goal (TB='Target Category Balance', TBD='Target Category Balance by Date', MF='Monthly Funding', NEED='Plan Your Spending')"
         },
         "goal_day": {
@@ -2436,7 +2431,8 @@
         },
         "flag_color": {
           "type": "string",
-          "enum": ["red", "orange", "yellow", "green", "blue", "purple", null],
+          "enum": ["red", "orange", "yellow", "green", "blue", "purple"],
+          "x-nullable": true,
           "description": "The transaction flag"
         },
         "import_id": {
@@ -2571,7 +2567,8 @@
         },
         "flag_color": {
           "type": "string",
-          "enum": ["red", "orange", "yellow", "green", "blue", "purple", null],
+          "enum": ["red", "orange", "yellow", "green", "blue", "purple"],
+          "x-nullable": true,
           "description": "The transaction flag"
         },
         "account_id": {
@@ -2623,9 +2620,9 @@
             "escrow",
             "balancedAdjustment",
             "credit",
-            "charge",
-            null
+            "charge"
           ],
+          "x-nullable": true,
           "description": "If the transaction is a debt/loan account transaction, the type of transaction"
         },
         "deleted": {
@@ -2908,7 +2905,8 @@
         },
         "flag_color": {
           "type": "string",
-          "enum": ["red", "orange", "yellow", "green", "blue", "purple", null],
+          "enum": ["red", "orange", "yellow", "green", "blue", "purple"],
+          "x-nullable": true,
           "description": "The scheduled transaction flag"
         },
         "account_id": {
