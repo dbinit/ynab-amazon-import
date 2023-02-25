@@ -2350,7 +2350,24 @@
     "SaveTransaction": {
       "allOf": [
         {
-          "required": ["account_id", "date", "amount"]
+          "type": "object",
+          "required": ["account_id", "date", "amount"],
+          "properties": {
+            "account_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "date": {
+              "type": "string",
+              "format": "date",
+              "description": "The transaction date in ISO format (e.g. 2016-12-01).  Future dates (scheduled transactions) are not permitted.  Split transaction dates cannot be changed and if a different date is supplied it will be ignored."
+            },
+            "amount": {
+              "type": "integer",
+              "format": "int64",
+              "description": "The transaction amount in milliunits format.  Split transaction amounts cannot be changed and if a different amount is supplied it will be ignored."
+            }
+          }
         },
         {
           "$ref": "#/definitions/SaveTransactionWithOptionalFields"
@@ -2374,6 +2391,20 @@
         {
           "type": "object",
           "properties": {
+            "account_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "date": {
+              "type": "string",
+              "format": "date",
+              "description": "The transaction date in ISO format (e.g. 2016-12-01).  Future dates (scheduled transactions) are not permitted.  Split transaction dates cannot be changed and if a different date is supplied it will be ignored."
+            },
+            "amount": {
+              "type": "integer",
+              "format": "int64",
+              "description": "The transaction amount in milliunits format.  Split transaction amounts cannot be changed and if a different amount is supplied it will be ignored."
+            },
             "id": {
               "type": "string"
             }
@@ -2387,20 +2418,6 @@
     "SaveTransactionWithOptionalFields": {
       "type": "object",
       "properties": {
-        "account_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "date": {
-          "type": "string",
-          "format": "date",
-          "description": "The transaction date in ISO format (e.g. 2016-12-01).  Future dates (scheduled transactions) are not permitted.  Split transaction dates cannot be changed and if a different date is supplied it will be ignored."
-        },
-        "amount": {
-          "type": "integer",
-          "format": "int64",
-          "description": "The transaction amount in milliunits format.  Split transaction amounts cannot be changed and if a different amount is supplied it will be ignored."
-        },
         "payee_id": {
           "type": "string",
           "format": "uuid",

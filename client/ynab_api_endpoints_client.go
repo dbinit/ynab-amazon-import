@@ -11,6 +11,7 @@ import (
 	"github.com/go-openapi/strfmt"
 
 	"github.com/dbinit/ynab-amazon-import/client/budgets"
+	"github.com/dbinit/ynab-amazon-import/client/transactions"
 )
 
 // Default YNAB API endpoints HTTP client.
@@ -56,6 +57,7 @@ func New(transport runtime.ClientTransport, formats strfmt.Registry) *YNABAPIEnd
 	cli := new(YNABAPIEndpoints)
 	cli.Transport = transport
 	cli.Budgets = budgets.New(transport, formats)
+	cli.Transactions = transactions.New(transport, formats)
 	return cli
 }
 
@@ -102,6 +104,8 @@ func (cfg *TransportConfig) WithSchemes(schemes []string) *TransportConfig {
 type YNABAPIEndpoints struct {
 	Budgets budgets.ClientService
 
+	Transactions transactions.ClientService
+
 	Transport runtime.ClientTransport
 }
 
@@ -109,4 +113,5 @@ type YNABAPIEndpoints struct {
 func (c *YNABAPIEndpoints) SetTransport(transport runtime.ClientTransport) {
 	c.Transport = transport
 	c.Budgets.SetTransport(transport)
+	c.Transactions.SetTransport(transport)
 }
