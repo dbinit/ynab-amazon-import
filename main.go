@@ -4,6 +4,7 @@ package main
 
 import (
 	"encoding/csv"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -100,6 +101,11 @@ func main() {
 	}
 
 	if *dryRun {
+		j, err := json.MarshalIndent(data, "", "\t")
+		if err != nil {
+			log.Fatalf("json.MarshalIndent(): %v", err)
+		}
+		log.Println(string(j))
 		return
 	}
 
@@ -379,7 +385,6 @@ func truncate(s string, l int) string {
 func buildTransactions(accountID *strfmt.UUID, odm, idm map[string]*orderDetail) []*models.SaveTransaction {
 	var transactions []*models.SaveTransaction
 	for oid, od := range mergeOrders(odm, idm) {
-		log.Printf("Order: %s, %s\n\n", oid, od)
 		t := &models.SaveTransaction{
 			AccountID: accountID,
 			Amount:    &od.totalCharged,
@@ -447,6 +452,7 @@ func mergeOrders(odm, idm map[string]*orderDetail) map[string]*orderDetail {
 		od, ok := odm[oid]
 		if !ok {
 			// No matching order, so just copy the item pseudo-order.
+			log.Printf("Missing order: %s, %s\n\n", oid, id)
 			odm[oid] = id
 			continue
 		}
