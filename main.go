@@ -48,7 +48,7 @@ const (
 	orderURL = "https://amzn.com/order-details/?orderID="
 
 	// CSV column names.
-	orderDate       = "Order Date"
+	shipmentDate    = "Shipment Date"
 	orderID         = "Order ID"
 	orderStatus     = "Order Status"
 	shippingCharge  = "Shipping Charge"
@@ -95,7 +95,7 @@ func main() {
 	}
 
 	// Build the transactions.
-	data := &models.PostTransactionsWrapper{Transactions: buildTransactions(accountID, odm, idm)}
+	data := &models.PostTransactionsWrapper{Transactions: buildTransactions(accountID, mergeOrders(odm, idm))}
 	if len(data.Transactions) == 0 {
 		log.Fatal("nothing to import")
 	}
@@ -156,7 +156,8 @@ func budgetAccount(budgetName, accountName string, authInfo runtime.ClientAuthIn
 }
 
 type orderDetail struct {
-	date            *strfmt.Date
+	orderID         string
+	shipmentDate    *strfmt.Date
 	shippingCharge  int64
 	totalPromotions int64
 	taxCharged      int64
@@ -171,7 +172,7 @@ func (od *orderDetail) String() string {
 	}
 	return fmt.Sprintf(
 		"Date: %s, Ship: %d, Promo: %d, Tax: %d, Total: %d%s",
-		od.date, od.shippingCharge, od.totalPromotions, od.taxCharged, od.totalCharged, items)
+		od.shipmentDate, od.shippingCharge, od.totalPromotions, od.taxCharged, od.totalCharged, items)
 }
 
 type itemDetail struct {
@@ -190,7 +191,7 @@ func (id *itemDetail) String() string {
 // parseOrders parses an Amazon order CSV and returns an orderDetail for each
 // order ID.
 func parseOrders(name string) (map[string]*orderDetail, error) {
-	rows, err := parseCSV(name, orderStatus, orderID, orderDate, shippingCharge, totalPromotions, taxCharged, totalCharged)
+	rows, err := parseCSV(name, orderStatus, orderID, shipmentDate, shippingCharge, totalPromotions, taxCharged, totalCharged)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse orders CSV: %w", err)
 	}
@@ -225,7 +226,7 @@ func parseOrders(name string) (map[string]*orderDetail, error) {
 // parseItems parses an Amazon item CSV and returns an orderDetail for each
 // order ID.
 func parseItems(name string) (map[string]*orderDetail, error) {
-	rows, err := parseCSV(name, orderStatus, orderID, orderDate, title, seller, itemSubtotalTax, itemTotal)
+	rows, err := parseCSV(name, orderStatus, orderID, shipmentDate, title, seller, itemSubtotalTax, itemTotal)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse items CSV: %w", err)
 	}
@@ -318,22 +319,23 @@ func parseCSV(name string, cols ...string) (rows []map[string]string, err error)
 }
 
 // getOrAddOrder checks for an existing orderDetail and returns it or adds a new
-// one and returns it.
+// one and returns it. Orders are grouped by order ID and shipment date.
 func getOrAddOrder(details map[string]*orderDetail, row map[string]string) (*orderDetail, error) {
+	// Get the transaction date.
+	date, err := parseDate(row[shipmentDate])
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse %s %q: %w", shipmentDate, row[shipmentDate], err)
+	}
+
 	// Check if there is already a record for the order ID.
 	oid := row[orderID]
-	if d, ok := details[oid]; ok {
+	key := date.String() + "-" + oid
+	if d, ok := details[key]; ok {
 		return d, nil
 	}
 
-	// Get the transaction date.
-	date, err := parseDate(row[orderDate])
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse %s %q: %w", orderDate, row[orderDate], err)
-	}
-
-	d := &orderDetail{date: date}
-	details[oid] = d
+	d := &orderDetail{orderID: oid, shipmentDate: date}
+	details[key] = d
 	return d, nil
 }
 
@@ -381,14 +383,56 @@ func truncate(s string, l int) string {
 	return string([]rune(s)[:l])
 }
 
+// mergeItems merges parsed orders and parsed items.
+func mergeOrders(odm, idm map[string]*orderDetail) map[string]*orderDetail {
+	for key, id := range idm {
+		od, ok := odm[key]
+		if !ok {
+			// No matching order, so just copy the item pseudo-order.
+			log.Printf("Missing order: %s\n\n", id)
+			odm[key] = id
+			continue
+		}
+
+		// Copy over items.
+		od.items = id.items
+
+		// If there is more total tax than item tax, assume it is for shipping.
+		if st := od.taxCharged - id.taxCharged; st < 0 && od.shippingCharge < 0 {
+			od.shippingCharge += st
+		}
+
+		// Add an item for any remaining balance.
+		if r := od.totalCharged - od.shippingCharge - od.totalPromotions - id.totalCharged; r != 0 {
+			od.items = append(od.items, &itemDetail{
+				title:     orderURL + od.orderID,
+				seller:    missingPayee,
+				itemTotal: r,
+			})
+		}
+	}
+	return odm
+}
+
 // buildTransactions builds new transactions from order details.
-func buildTransactions(accountID *strfmt.UUID, odm, idm map[string]*orderDetail) []*models.SaveTransaction {
+func buildTransactions(accountID *strfmt.UUID, odm map[string]*orderDetail) []*models.SaveTransaction {
+	// Create transactions in key order.
+	keys := make([]string, 0, len(odm))
+	for k := range odm {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 	var transactions []*models.SaveTransaction
-	for oid, od := range mergeOrders(odm, idm) {
+	for _, k := range keys {
+		od := odm[k]
+		if od.totalCharged == 0 {
+			// Skip $0 orders.
+			continue
+		}
 		t := &models.SaveTransaction{
 			AccountID: accountID,
 			Amount:    &od.totalCharged,
-			Date:      od.date,
+			Date:      od.shipmentDate,
 			SaveTransactionWithOptionalFields: models.SaveTransactionWithOptionalFields{
 				Cleared:   models.SaveTransactionWithOptionalFieldsClearedCleared,
 				FlagColor: color,
@@ -397,7 +441,7 @@ func buildTransactions(accountID *strfmt.UUID, odm, idm map[string]*orderDetail)
 		transactions = append(transactions, t)
 		if len(od.items) == 0 {
 			// Missing items.
-			t.Memo = truncate(orderURL+oid, 200)
+			t.Memo = truncate(orderURL+od.orderID, 200)
 			t.PayeeName = truncate(defaultPayee, 50)
 			continue
 		}
@@ -444,35 +488,4 @@ func buildTransactions(accountID *strfmt.UUID, odm, idm map[string]*orderDetail)
 		}
 	}
 	return transactions
-}
-
-// mergeItems merges parsed orders and parsed items.
-func mergeOrders(odm, idm map[string]*orderDetail) map[string]*orderDetail {
-	for oid, id := range idm {
-		od, ok := odm[oid]
-		if !ok {
-			// No matching order, so just copy the item pseudo-order.
-			log.Printf("Missing order: %s, %s\n\n", oid, id)
-			odm[oid] = id
-			continue
-		}
-
-		// Copy over items.
-		od.items = id.items
-
-		// If there is more total tax than item tax, assume it is for shipping.
-		if st := od.taxCharged - id.taxCharged; st < 0 && od.shippingCharge < 0 {
-			od.shippingCharge += st
-		}
-
-		// Add an item for any remaining balance.
-		if r := od.totalCharged - od.shippingCharge - od.totalPromotions - id.totalCharged; r != 0 {
-			od.items = append(od.items, &itemDetail{
-				title:     orderURL + oid,
-				seller:    missingPayee,
-				itemTotal: r,
-			})
-		}
-	}
-	return odm
 }
