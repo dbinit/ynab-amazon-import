@@ -31,11 +31,14 @@ var (
 	account = flag.String("account", "", "YNAB account name")
 	orders  = flag.String("orders", "", "Amazon orders CSV file")
 	items   = flag.String("items", "", "Amazon items CSV file")
+	color   = flag.String("color", "", "Optional flag color for imported transactions")
+	dryRun  = flag.Bool("dry_run", false, "Dry run.")
 )
 
 const (
-	// Default payee.
-	payeeName = "Amazon"
+	// Default payee names.
+	defaultPayee = "Amazon"
+	missingPayee = "Missing"
 
 	// Amazon CSV date format.
 	dateFormat = "01/02/06"
@@ -46,12 +49,18 @@ const (
 	// CSV column names.
 	orderDate       = "Order Date"
 	orderID         = "Order ID"
+	orderStatus     = "Order Status"
 	shippingCharge  = "Shipping Charge"
 	totalPromotions = "Total Promotions"
+	taxCharged      = "Tax Charged"
 	totalCharged    = "Total Charged"
 	title           = "Title"
 	seller          = "Seller"
+	itemSubtotalTax = "Item Subtotal Tax"
 	itemTotal       = "Item Total"
+
+	// Shipped "Order Status" value.
+	shipped = "Shipped"
 )
 
 func main() {
@@ -74,51 +83,24 @@ func main() {
 		log.Fatal(err)
 	}
 
-	otm, err := orderTransactions(*orders, accountID)
+	odm, err := parseOrders(*orders)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	itm, err := itemTransactions(*items, accountID)
+	idm, err := parseItems(*items)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	for oid, s := range itm {
-		if t, ok := otm[oid]; ok {
-			// Append the subtransactions to an existing transaction.
-			t.Subtransactions = append(t.Subtransactions, s.Subtransactions...)
-			continue
-		}
-		// Copy the full item transaction if an order transaction is missing.
-		otm[oid] = s
+	// Build the transactions.
+	data := &models.PostTransactionsWrapper{Transactions: buildTransactions(accountID, odm, idm)}
+	if len(data.Transactions) == 0 {
+		log.Fatal("nothing to import")
 	}
 
-	data := &models.PostTransactionsWrapper{}
-	for oid, t := range otm {
-		data.Transactions = append(data.Transactions, t)
-		if len(t.Subtransactions) == 0 {
-			continue
-		}
-		// Make sure the subtransactions add up to the transaction total.
-		amount := *t.Amount
-		for _, s := range t.Subtransactions {
-			amount -= *s.Amount
-		}
-		if amount != 0 {
-			t.Subtransactions = append(t.Subtransactions, &models.SaveSubTransaction{
-				Amount:    &amount,
-				Memo:      orderURL + oid,
-				PayeeName: payeeName,
-			})
-		}
-		if len(t.Subtransactions) > 1 {
-			continue
-		}
-		// Collapse single item orders.
-		t.Memo = t.Subtransactions[0].Memo
-		t.PayeeName = t.Subtransactions[0].PayeeName
-		t.Subtransactions = nil
+	if *dryRun {
+		return
 	}
 
 	params := transactions.NewCreateTransactionParams().WithBudgetID(budgetID.String()).WithData(data)
@@ -167,112 +149,114 @@ func budgetAccount(budgetName, accountName string, authInfo runtime.ClientAuthIn
 	return bid, aid, nil
 }
 
-// ptrOf returns a pointer to a value of any type.
-func ptrOf[T any](v T) *T { return &v }
+type orderDetail struct {
+	date            *strfmt.Date
+	shippingCharge  int64
+	totalPromotions int64
+	taxCharged      int64
+	totalCharged    int64
+	items           []*itemDetail
+}
 
-// orderTransactions parses an Amazon order CSV and returns a transaction for
-// each order ID.
-func orderTransactions(name string, accountID *strfmt.UUID) (map[string]*models.SaveTransaction, error) {
-	rows, err := parseCSV(name, orderDate, orderID, shippingCharge, totalPromotions, totalCharged)
+func (od *orderDetail) String() string {
+	var items string
+	for i, id := range od.items {
+		items += fmt.Sprintf("\n\t%02d %s", i, id)
+	}
+	return fmt.Sprintf(
+		"Date: %s, Ship: %d, Promo: %d, Tax: %d, Total: %d%s",
+		od.date, od.shippingCharge, od.totalPromotions, od.taxCharged, od.totalCharged, items)
+}
+
+type itemDetail struct {
+	title       string
+	seller      string
+	subTotalTax int64
+	itemTotal   int64
+}
+
+func (id *itemDetail) String() string {
+	return fmt.Sprintf(
+		"Seller: %q, Tax: %d, Total: %d, Title: %q",
+		id.seller, id.subTotalTax, id.itemTotal, id.title)
+}
+
+// parseOrders parses an Amazon order CSV and returns an orderDetail for each
+// order ID.
+func parseOrders(name string) (map[string]*orderDetail, error) {
+	rows, err := parseCSV(name, orderStatus, orderID, orderDate, shippingCharge, totalPromotions, taxCharged, totalCharged)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse orders CSV: %w", err)
 	}
 
-	otm := make(map[string]*models.SaveTransaction)
-	for _, r := range rows {
-		// Get the transaction amount.
-		amount, err := parseMoney(r[totalCharged], true)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse %s %q: %w", totalCharged, r[totalCharged], err)
+	details := make(map[string]*orderDetail)
+	for _, row := range rows {
+		// Skip orders that haven't shipped.
+		if row[orderStatus] != shipped {
+			continue
 		}
 
-		// Get the transaction date.
-		date, err := parseDate(r[orderDate])
+		// Get or add an order record.
+		od, err := getOrAddOrder(details, row)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse %s %q: %w", orderDate, r[orderDate], err)
+			return nil, err
 		}
 
-		// Add subtransactions for any shipping charges or promo discounts.
-		var subs []*models.SaveSubTransaction
-		for _, c := range []string{shippingCharge, totalPromotions} {
-			if amount, err := parseMoney(r[c], c != totalPromotions); err != nil {
-				return nil, fmt.Errorf("failed to parse %s %q: %w", c, r[c], err)
-			} else if amount != 0 {
-				subs = append(subs, &models.SaveSubTransaction{
-					Amount:    &amount,
-					Memo:      c,
-					PayeeName: payeeName,
-				})
+		// Parse the order amounts.
+		amounts := []*int64{&od.shippingCharge, &od.totalPromotions, &od.taxCharged, &od.totalCharged}
+		for i, col := range []string{shippingCharge, totalPromotions, taxCharged, totalCharged} {
+			n, err := parseMoney(row[col], col != totalPromotions)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse %s %q: %w", col, row[col], err)
 			}
-		}
-
-		// Build the transaction.
-		otm[r[orderID]] = &models.SaveTransaction{
-			AccountID: accountID,
-			Amount:    &amount,
-			Date:      date,
-			SaveTransactionWithOptionalFields: models.SaveTransactionWithOptionalFields{
-				Cleared:         models.SaveTransactionWithOptionalFieldsClearedCleared,
-				PayeeName:       payeeName,
-				Subtransactions: subs,
-			},
+			*amounts[i] += n
 		}
 	}
 
-	return otm, nil
+	return details, nil
 }
 
-// itemTransactions parses an Amazon item CSV and returns a transaction for
-// each order ID.
-func itemTransactions(name string, accountID *strfmt.UUID) (map[string]*models.SaveTransaction, error) {
-	rows, err := parseCSV(name, orderDate, orderID, title, seller, itemTotal)
+// parseItems parses an Amazon item CSV and returns an orderDetail for each
+// order ID.
+func parseItems(name string) (map[string]*orderDetail, error) {
+	rows, err := parseCSV(name, orderStatus, orderID, orderDate, title, seller, itemSubtotalTax, itemTotal)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse items CSV: %w", err)
 	}
 
-	itm := make(map[string]*models.SaveTransaction)
-	for _, r := range rows {
-		// Get the subtransaction amount.
-		amount, err := parseMoney(r[itemTotal], true)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse %s %q: %w", itemTotal, r[itemTotal], err)
-		}
-
-		// Build the subtransaction.
-		s := &models.SaveSubTransaction{
-			Amount:    &amount,
-			Memo:      truncate(r[title], 200),
-			PayeeName: truncate(r[seller], 50),
-		}
-
-		// Add to an existing transaction.
-		oid := r[orderID]
-		if t, ok := itm[oid]; ok {
-			*t.Amount += amount
-			t.Subtransactions = append(t.Subtransactions, s)
+	details := make(map[string]*orderDetail)
+	for _, row := range rows {
+		// Skip items that haven't shipped.
+		if row[orderStatus] != shipped {
 			continue
 		}
 
-		// Get the transaction date.
-		date, err := parseDate(r[orderDate])
+		// Get or add an order record.
+		od, err := getOrAddOrder(details, row)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse %s %q: %w", orderDate, r[orderDate], err)
+			return nil, err
 		}
 
-		// Build a new transaction.
-		itm[oid] = &models.SaveTransaction{
-			AccountID: accountID,
-			Amount:    ptrOf(amount), // Don't reuse the subtransaction pointer.
-			Date:      date,
-			SaveTransactionWithOptionalFields: models.SaveTransactionWithOptionalFields{
-				Cleared:         models.SaveTransactionWithOptionalFieldsClearedCleared,
-				PayeeName:       payeeName,
-				Subtransactions: []*models.SaveSubTransaction{s},
-			},
+		// Create an item record.
+		id := &itemDetail{title: row[title], seller: row[seller]}
+
+		// Parse the item amounts.
+		amounts := []*int64{&id.subTotalTax, &id.itemTotal}
+		for i, col := range []string{itemSubtotalTax, itemTotal} {
+			n, err := parseMoney(row[col], true)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse %s %q: %w", col, row[col], err)
+			}
+			*amounts[i] = n
 		}
+
+		// Add the item and amounts to the order.
+		od.taxCharged += id.subTotalTax
+		od.totalCharged += id.itemTotal
+		od.items = append(od.items, id)
 	}
 
-	return itm, nil
+	return details, nil
 }
 
 // parseCSV parses a CSV file and extracts named columns into a string map for
@@ -327,6 +311,26 @@ func parseCSV(name string, cols ...string) (rows []map[string]string, err error)
 	return rows, nil
 }
 
+// getOrAddOrder checks for an existing orderDetail and returns it or adds a new
+// one and returns it.
+func getOrAddOrder(details map[string]*orderDetail, row map[string]string) (*orderDetail, error) {
+	// Check if there is already a record for the order ID.
+	oid := row[orderID]
+	if d, ok := details[oid]; ok {
+		return d, nil
+	}
+
+	// Get the transaction date.
+	date, err := parseDate(row[orderDate])
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse %s %q: %w", orderDate, row[orderDate], err)
+	}
+
+	d := &orderDetail{date: date}
+	details[oid] = d
+	return d, nil
+}
+
 // parseDate returns the YNAB date representation of an Amazon CSV date string.
 func parseDate(date string) (*strfmt.Date, error) {
 	d, err := time.ParseInLocation(dateFormat, date, time.Local)
@@ -335,6 +339,9 @@ func parseDate(date string) (*strfmt.Date, error) {
 	}
 	return ptrOf(strfmt.Date(d)), nil
 }
+
+// ptrOf returns a pointer to a value of any type.
+func ptrOf[T any](v T) *T { return &v }
 
 // parseMoney returns the YNAB int64 representation of an Amazon CSV currency
 // string. E.g. "$12.34" becomes 12340.
@@ -366,4 +373,100 @@ func truncate(s string, l int) string {
 		return s
 	}
 	return string([]rune(s)[:l])
+}
+
+// buildTransactions builds new transactions from order details.
+func buildTransactions(accountID *strfmt.UUID, odm, idm map[string]*orderDetail) []*models.SaveTransaction {
+	var transactions []*models.SaveTransaction
+	for oid, od := range mergeOrders(odm, idm) {
+		log.Printf("Order: %s, %s\n\n", oid, od)
+		t := &models.SaveTransaction{
+			AccountID: accountID,
+			Amount:    &od.totalCharged,
+			Date:      od.date,
+			SaveTransactionWithOptionalFields: models.SaveTransactionWithOptionalFields{
+				Cleared:   models.SaveTransactionWithOptionalFieldsClearedCleared,
+				FlagColor: color,
+			},
+		}
+		transactions = append(transactions, t)
+		if len(od.items) == 0 {
+			// Missing items.
+			t.Memo = truncate(orderURL+oid, 200)
+			t.PayeeName = truncate(defaultPayee, 50)
+			continue
+		}
+		if len(od.items) == 1 {
+			// Single item.
+			t.Memo = truncate(od.items[0].title, 200)
+			t.PayeeName = truncate(od.items[0].seller, 50)
+			continue
+		}
+		// Apply any promotional amounts to shipping charges.
+		if n := od.shippingCharge + od.totalPromotions; n < 0 {
+			// Create a subtransaction for the remaining shipping charge.
+			t.Subtransactions = append(t.Subtransactions, &models.SaveSubTransaction{
+				Amount:    &n,
+				Memo:      truncate(shippingCharge, 200),
+				PayeeName: truncate(defaultPayee, 50),
+			})
+		} else if n > 0 {
+			// Create a subtransaction for the remaining promo total.
+			t.Subtransactions = append(t.Subtransactions, &models.SaveSubTransaction{
+				Amount:    &n,
+				Memo:      truncate(totalPromotions, 200),
+				PayeeName: truncate(defaultPayee, 50),
+			})
+		}
+		// Create subtransactions for each of the order items.
+		var multiPayee bool
+		for _, id := range od.items {
+			payeeName := truncate(id.seller, 50)
+			t.Subtransactions = append(t.Subtransactions, &models.SaveSubTransaction{
+				Amount:    &id.itemTotal,
+				Memo:      truncate(id.title, 200),
+				PayeeName: payeeName,
+			})
+			if multiPayee || payeeName == t.PayeeName {
+				continue
+			}
+			// If all items have the same payee, propagate it to the transaction.
+			if multiPayee = t.PayeeName != ""; multiPayee {
+				t.PayeeName = ""
+			} else {
+				t.PayeeName = payeeName
+			}
+		}
+	}
+	return transactions
+}
+
+// mergeItems merges parsed orders and parsed items.
+func mergeOrders(odm, idm map[string]*orderDetail) map[string]*orderDetail {
+	for oid, id := range idm {
+		od, ok := odm[oid]
+		if !ok {
+			// No matching order, so just copy the item pseudo-order.
+			odm[oid] = id
+			continue
+		}
+
+		// Copy over items.
+		od.items = id.items
+
+		// If there is more total tax than item tax, assume it is for shipping.
+		if st := od.taxCharged - id.taxCharged; st < 0 && od.shippingCharge < 0 {
+			od.shippingCharge += st
+		}
+
+		// Add an item for any remaining balance.
+		if r := od.totalCharged - od.shippingCharge - od.totalPromotions - id.totalCharged; r != 0 {
+			od.items = append(od.items, &itemDetail{
+				title:     orderURL + oid,
+				seller:    missingPayee,
+				itemTotal: r,
+			})
+		}
+	}
+	return odm
 }
